@@ -1,0 +1,780 @@
+from astrodendro import Dendrogram, ppp_catalog, pp_catalog
+import pickle
+import sys
+from astropy.table import Table, vstack
+import numpy as np
+from astropy import units as u
+from astropy.coordinates import SkyCoord
+import yt
+from astropy.io import fits
+from astropy.wcs import WCS
+import statistics
+import matplotlib.pyplot as plt
+from numba.tests.test_array_constants import dt
+import pandas as pd
+import helpersFunctions as hf
+import os
+import pyvista as pv
+import numpy as np
+
+
+class node:
+    def __init__(self, idx, parent=None, children=None, descendents=None):
+        self.idx = idx
+        self.children = children
+        self.parent = parent
+        self.descendents = descendents
+
+
+def threed_extract(cloud_name, locations):
+    fn = '/Users/shlomo/Desktop/Thesis/pythonProject/Leike/Leike General/leike_2020_xyz.fits'
+    data_full, header_orig = fits.getdata(fn, header=True)
+
+    w_full = WCS(fn)
+
+    cloud = cloud_name
+    xcen, ycen, zcen = locations[0], locations[1], locations[2]  # -267, 97, -101  # central coordinates for cutout
+    pixcen = w_full.wcs_world2pix([[xcen, ycen, zcen]], 0)[0].astype(int)
+
+    half_box_size = 50
+    # if pixcen[2] - half_box_size < 0 it gets 0. pixcen[2] + half_box_size (539)
+    # clip pixcen[2] at 0, and pixcen[0], [1] at 740. negative clipps at 0, positive at 539 for z 739 for the others.
+    subcube = data_full[pixcen[2] - half_box_size:pixcen[2] + half_box_size,
+              pixcen[1] - half_box_size:pixcen[1] + half_box_size, pixcen[0] - half_box_size:pixcen[0] + half_box_size]
+    """
+    If is just for leike clouds per the meeting
+    """
+    print("pixcen 2: ", pixcen[2] - half_box_size < 0, pixcen[2] + half_box_size > 739)
+    print("pixcen 1: ", pixcen[1] - half_box_size < 0, pixcen[1] + half_box_size > 739)
+    print("pixcen 0: ", pixcen[0] + half_box_size > 539, pixcen[0] - half_box_size < 0)
+
+    # if pixcen[2] - half_box_size < 0:
+    #     return -1
+    # if pixcen[2] + half_box_size > 739:
+    #     return -1
+    if pixcen[1] - half_box_size < 0:
+        return -1, -1, -1
+    # if pixcen[1] + half_box_size > 739:
+    #     return -1
+    # if pixcen[0] + half_box_size > 539:
+    #     return -1
+    if pixcen[0] - half_box_size < 0:
+        return -1, -1, -1
+
+    # if we clip the above, NAXIS1 gets: -3*-1
+
+    header_orig['NAXIS1'] = half_box_size * 2
+    header_orig['NAXIS2'] = half_box_size * 2
+    header_orig['NAXIS3'] = half_box_size * 2
+    header_orig['CRVAL1'] = xcen - half_box_size
+    header_orig['CRVAL2'] = ycen - half_box_size
+    header_orig['CRVAL3'] = zcen - half_box_size
+
+    fits.writeto("{}_3d_cutout_SQUARE.fits".format(cloud), subcube, header_orig, overwrite=True)
+
+    nH2_nden = fits.getdata("{}_3d_cutout_SQUARE.fits".format(cloud))
+
+    hdu = fits.PrimaryHDU(nH2_nden)
+    hdu.header['CDELT1'] = 3e+18
+    hdu.header['CDELT2'] = 3e+18
+    hdu.header['CDELT3'] = 3e+18
+    hdu.header['CUNIT1'] = 'cm'
+    hdu.header['CUNIT2'] = 'cm'
+    hdu.header['CUNIT3'] = 'cm'
+    hdu.header['BTYPE'] = 'density'
+    hdu.header['BUNIT'] = '1/cm/cm/cm'
+    hdu.header['CRVAL1'] = 0
+    hdu.header['CRVAL2'] = 0
+    hdu.header['CRVAL3'] = 0
+    hdu.header['CRPIX1'] = 0
+    hdu.header['CRPIX2'] = 0
+    hdu.header['CRPIX3'] = 0
+
+    hdu.writeto('{}_yt_density.fits'.format(cloud), overwrite=True)
+    w = WCS('{}_3d_cutout_SQUARE.fits'.format(cloud))
+    data = fits.getdata("{}_3d_cutout_SQUARE.fits".format(cloud))
+
+    zpix_cen = data.shape[0] / 2.
+    ypix_cen = data.shape[1] / 2.
+    xpix_cen = data.shape[2] / 2.
+
+    world = w.wcs_pix2world([[xpix_cen, ypix_cen, zpix_cen]], 0) - 2
+    c = SkyCoord(u=world[0, 0] * u.pc, v=world[0, 1] * u.pc, w=world[0, 2] * u.pc, frame='galactic',
+                 representation_type='cartesian')
+
+    lcen = np.round(c.spherical.lon.deg, 2)  # Add these propeties to the catalog
+    bcen = np.round(c.spherical.lat.deg, 2)
+    dcen = c.spherical.distance.pc.astype(int)
+
+    ds = yt.load('{}_yt_density.fits'.format(cloud, cloud))
+
+    L = world[0] * -1
+
+    # Column density PNGS
+    ytproj = yt.OffAxisProjectionPlot(ds, L, 'density', north_vector=[0, 0, 1])
+    ytproj.set_cmap('density', 'Greys')
+    ytproj.show()
+
+    # Column density fits
+    fitsproj = yt.FITSOffAxisProjection(ds, L, 'density', north_vector=[0, 0, 1])
+    Nproj = fitsproj.get_data('density').value
+    Aproj = Nproj / (1.67e+22)
+
+    theta = 1. * 206265 / dcen
+    fitsproj.create_sky_wcs(sky_center=(lcen, bcen), sky_scale=(theta, 'arcsec/pc'), ctype=['GLON-CAR', 'GLAT-CAR'])
+    fitsproj.writeto('{}_yt_extinction.fits'.format(cloud, cloud), overwrite=True)
+
+    data, header = fits.getdata("{}_yt_extinction.fits".format(cloud, cloud), header=True)
+    header['EXTNAME'] = 'EXTINCTION'
+    header['BTYPE'] = 'K Band extinction'
+    header['BUNIT'] = 'mag'
+    fits.writeto("{}_yt_extinction.fits".format(cloud), Aproj, header, overwrite=True)
+    print(lcen, bcen, dcen)
+    return lcen, bcen, dcen
+
+
+def ppcloud(cloud_name, lcen, bcen, distance):
+    file_path = '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/ophiuchus_test_yt_extinction.fits'
+    header = fits.getheader(file_path)
+    image = fits.getdata(file_path)
+    d = Dendrogram.compute(image, min_value=0.1, min_delta=0.15,
+                           min_npix=300)  # can make min delta 0.05 for clouds with no features.
+    if len(d) == 0:
+        print("no structures dend for: ", cloud_name)
+        return
+    d.save_to("{}Dendrogram.fits".format(cloud_name))
+    # d = Dendrogram.compute(image, min_value=25, min_delta=25, min_npix=150, verbose=True)
+    # metadata = {'data_unit': u.cm ** (-3), 'spatial_scale': 1 * u.parsec, 'wcs': wcs}
+    lcen, bcen, dcen = 357.51, 13.63, 142
+    metadata = {'data_unit': u.mag, 'spatial_scale': header["CDELT2"] * u.degree, 'distance': distance * 1.0,
+                'latitude': bcen * 1.0, 'longitude': lcen * 1.0}
+    cat = pp_catalog(d, metadata)
+    print(cloud_name)
+    cat.write("{}_Catalog.fits".format(cloud_name))
+
+
+def catalog_makers():
+    base_table = pd.read_excel(
+        r'/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/old files/Table_Zucker.xlsx')
+    base_table = Table.read('/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/3D_Catalog_named_sigfigs.fits')
+
+    for cloud_number in range(0, len(base_table)):
+        cloud_name = base_table["cloud"][cloud_number]
+        # if cloud_name == 'Coraus':
+        #     continue
+        cloud_name = cloud_name + " 2D ID:{}".format(cloud_number)
+        print(cloud_name)
+        # getting locations from catalog
+        locations_xyz = [base_table["x_pc"][cloud_number], base_table["y_pc"][cloud_number],
+                         base_table["z_pc"][cloud_number]]
+        lcen, bcen, distance = threed_extract(cloud_name, locations_xyz)
+        if distance == -1:
+            print("skipped")
+            continue
+
+        print("Made files, now Dendrograming and creating catalogs")
+        ppcloud(cloud_name, lcen, bcen, distance)
+
+
+def clouds():
+    Cepheus = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/catalogs_leike_features_2D/Cepheus 2D ID:59_Catalog.fits')
+    Chamaeleon = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/2D/Chamaeleon/ChamaeleonCatalog.fits')
+    Ophiuchus = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/catalogs_leike_features_2D/Ophiuchus 2D ID:42_Catalog.fits')
+    Lupus = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/catalogs_leike_features_2D/Lupus 2D ID:33_Catalog.fits')
+    Taurus = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/catalogs_leike_features_2D/Taurus 2D ID:22_Catalog.fits')
+    Perseus = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/catalogs_leike_features_2D/Perseus 2D ID:6_Catalog.fits')
+    Musca = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/catalogs_leike_features_2D/Musca 2D ID:20_Catalog.fits')
+    Pipe = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/catalogs_leike_features_2D/Pipe 2D ID:34_Catalog.fits')
+    OriaonA = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/catalogs_leike_features_2D/OrionA_Catalog.fits')
+    Oriaonb = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/catalogs_leike_features_2D/OrionB_Catalog.fits')
+    Oriaonlam = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/catalogs_leike_features_2D/OrionLAM_Catalog.fits')
+
+    Catalog = vstack([Cepheus, Chamaeleon, Ophiuchus, Lupus, Taurus, Perseus, Musca, Pipe, OriaonA, Oriaonb, Oriaonlam],
+                     join_type='inner')
+    Catalog.write('11famousClouds2D.fits')
+    return
+
+    # Combines all 2D Catalogs into one big catalog.
+
+    path = "/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/catalogs_leike_features_2D"
+    obj1 = Table.read('/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/Cloud number 0 2D ID:0_Catalog.fits')
+    with os.scandir(path) as it:
+        for entry in it:
+            table = Table.read(entry.path)
+            obj1 = vstack([obj1, table], join_type='exact')
+
+    radius_log10 = np.log10(obj1["radius"])
+    mass_log10 = np.log10(obj1["mass"])
+
+    obj1.add_column(radius_log10, name='Radius_log10', index=12)
+    obj1.add_column(mass_log10, name='Mass_log10', index=12)
+
+    obj1.rename_column('latitude', 'Longitude')
+    obj1.rename_column('longitude', 'latitude')
+    obj1.rename_column('Longitude', 'longitude')
+
+    obj1.write('/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/2D_offical_catalog.fits')
+    # Larson1981['Mass'].unit = u.Msun
+    # Larson1981['Radius'].unit = u.pc
+
+
+def plotcloud(Catalog):
+    print(Catalog)
+    x_data = np.log10(Catalog["radius"])
+    y_data = np.log10(Catalog["mass"])
+    plt.scatter(x_data, y_data, c='b', label='Mass-Size Scatter Plot')
+    m = np.polyfit(x_data, y_data, 1)[0]
+    b = np.polyfit(x_data, y_data, 1)[1]
+    coeffs_20 = [m, b]
+    coeffs_20[1] = hf.to_significant_figures(b, 3)
+    coeffs_20[0] = hf.to_significant_figures(m, 3)
+    uncertainties = [hf.to_significant_figures(statistics.stdev(x_data), 3),
+                     hf.to_significant_figures(statistics.stdev(y_data), 3)]
+    equation = 'LogM = {}LogR(\u00B1 {}) + {}(\u00B1{})'.format \
+        (coeffs_20[0], uncertainties[0], coeffs_20[1], uncertainties[1])
+    equationSolved = '\n$M = 407.38_{M_\odot}R^{1.72}$'
+    m = float(coeffs_20[0])
+    b = float(coeffs_20[1])
+    plt.plot(x_data, m * x_data + b, c='r', label=equation + equationSolved)
+    plt.legend()
+    # plt.style.use('seaborn-whitegrid')
+    plt.ylabel('Log Mass$\odot$')
+    plt.xlabel('Log Radius (pc)')
+    plt.title('Mass-Size Relation Leike 2D')
+    plt.show()
+    print(equation)
+
+
+def excel_to_table():
+    df = pd.read_excel('Other catalogs/Larson1981Data.xlsx')
+    objects = df['Object'].tolist()
+    masses = df['Mass(sm)'].tolist()
+    linear = df['R(pc)'].tolist()
+    radii = []
+    for i in range(len(linear)):
+        radii.append(linear[i] / 2)
+
+    df['R(pc)'] = radii
+
+    rows = []
+    for i in range(len(linear)):
+        rows.append([objects[i], radii[i], masses[i]])
+
+    units = {'R(pc)': u.pc, 'Mass(sm)': u.Msun}
+
+    # Larson1981 = Table.from_pandas(df, index=True, units={'R(pc)': u.pc, 'Mass(sm)': u.Msun})
+
+    Larson1981 = Table(rows=rows, names=['Object', 'Radius', 'Mass'])
+    Larson1981['Mass'].unit = u.Msun
+    Larson1981['Radius'].unit = u.pc
+    Larson1981.write('Other catalogs/Larson1981Catalog.fits')
+
+
+def convert_deg_to_pc():
+    rice = Table.read('Other catalogs/RiceCatalog.fits')
+
+    distance = rice['distance'].to(u.pc)
+    radius = rice['radius']
+    d = []
+    for i in range(len(radius)):
+        d.append((distance[i] * radius[i] * 3600) / 206265 / u.pc)
+
+    rice.add_column(d, name='radius_pc', index=0)
+    rice['radius_pc'].unit = u.pc
+    print(rice['mass'])
+
+
+def remove_unnamed():
+    catalog = Table.read(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/Recognized Catalogs with Names/Leike2Scheme_withNames.fits')
+    rows_to_remove = []
+    for i in range(len(catalog)):
+        if catalog['cloud'][i] == "Unidentified":
+            rows_to_remove.append(catalog['_idx'][i])
+    for i in range(len(rows_to_remove)):
+        catalog.remove_row(hf.row_number(catalog, rows_to_remove[i]))
+    col = [1] * len(catalog)
+    catalog.add_column(col, name='feature_exists', index=0)
+
+    catalog.write(
+        '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/Recognized Catalogs with Names/Leike2Scheme_famous3D.fits')
+    print(catalog)
+
+
+def pipes_schems_compare(d, metadata):
+    nodes = []
+    structs = hf.all_structs(d)
+    for i in range(len(structs)):
+        children = []
+        des = []
+        if structs[i].parent is not None:
+            parent = structs[i].parent.idx
+        else:
+            parent = structs[i].parent
+        if len(structs[i].children) != 0:
+            for j in range(len(structs[i].children)):
+                children.append(structs[i].children[j].idx)
+        if len(structs[i].descendants) != 0:
+            for j in range(len(structs[i].descendants)):
+                des.append(structs[i].descendants[j].idx)
+        nodes.append(node(structs[i].idx, parent, children, des))
+
+    # Creating schemes:
+    pipe_1 = ppp_catalog(d, metadata)
+    pipe_2 = ppp_catalog(d, metadata)
+    hf.first_scheme(nodes, pipe_1, min_mass=500)
+    for i in range(len(structs)):
+        children = []
+        des = []
+        if structs[i].parent is not None:
+            parent = structs[i].parent.idx
+        else:
+            parent = structs[i].parent
+        if len(structs[i].children) != 0:
+            for j in range(len(structs[i].children)):
+                children.append(structs[i].children[j].idx)
+        if len(structs[i].descendants) != 0:
+            for j in range(len(structs[i].descendants)):
+                des.append(structs[i].descendants[j].idx)
+        nodes.append(node(structs[i].idx, parent, children, des))
+
+    hf.table_objects_deleted_2(nodes, pipe_2, min_mass=500)
+    print(len(pipe_1), len(pipe_2))
+    pipe_1.write('pipe_1.fits')
+    pipe_2.write('pipe_2.fits')
+
+    # run ppp_catalog with leike dendrogram, then run second scheme on it, then
+
+
+def short_figures(i, n):
+    # num =  ('{:g}'.format(float('{:.{p}g}'.format(i, p=n))))
+    num = '{:.1f}'.format(i)
+    return num.strip(".0")
+
+
+def edit_table(catalog):
+    catalog.remove_columns(['_idx', 'x_pix', 'y_pix', 'z_pix'])
+
+    n = 2
+    masses = []
+    volumes = []
+    radius = []
+    for row in catalog:
+        row['surface_area'] = short_figures(row['surface_area'], 0)
+        row['mass_over_surface_area'] = short_figures(row['mass_over_surface_area'], 0)
+        row['a_sigma'] = short_figures(row['a_sigma'], 0)
+        row['b_sigma'] = short_figures(row['b_sigma'], 0)
+        row['c_sigma'] = short_figures(row['c_sigma'], 0)
+        row['peak_density'] = short_figures(row['peak_density'], 0)
+
+        row['latitude'] = short_figures(row['latitude'], 0)
+        row['longitude'] = short_figures(row['longitude'], 0)
+        row['radius'] = short_figures(row['radius'], 0)
+        row['volume_exact'] = int(row['volume_exact'])
+        row['x_pc'] = int(row['x_pc'])
+        row['x_pc'] = int(row['x_pc'])
+        row['y_pc'] = int(row['y_pc'])
+        row['z_pc'] = int(row['z_pc'])
+        row['density'] = int(row['density'])
+        row['azimuth'] = int(row['azimuth'])
+        row['elevation'] = int(row['elevation'])
+        row['distance'] = int(row['distance'])
+        num = row['mass']
+        num = "{:.1e}".format(num)
+        masses.append(num)
+        num = row['volume_ellipsoid']
+        num = "{:.1e}".format(num)
+        volumes.append(num)
+        # num = "{:.1e}".format(num)
+        # radius.append(num)
+
+    catalog.remove_column('mass')
+    catalog.add_column(masses, name='mass', index=7)
+    catalog.remove_column('volume_ellipsoid')
+    catalog.add_column(volumes, name='volume_ellipsoid', index=10)
+    catalog.show_in_browser()
+    catalog.write('3D_Catalog.csv', format='csv', overwrite=True)
+    # catalog.write('Table_3D_latex', format='latex', overwrite=True)
+
+
+def table_2d():
+    cat = Table.read('/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/2D_offical_catalog.fits')
+    mass_over_surface_area = []
+    for i in range(len(cat)):
+        mass_over_surface_area.append(cat['mass'][i] / cat[i]['area_exact'])
+    cat.add_column(mass_over_surface_area, name='surface_density')
+    distance = cat['distancer']
+    radius = cat['minor_sigma']
+    d = []
+    for i in range(len(radius)):
+        d.append((distance[i] * radius[i] * 3600) / 206265)
+
+    cat.add_column(d, name='minor_sigma_pc', index=7)
+    cat['minor_sigma_pc'].unit = u.pc
+
+    distance = cat['distancer']
+    radius = cat['major_sigma']
+    d = []
+    for i in range(len(radius)):
+        d.append((distance[i] * radius[i] * 3600) / 206265)
+
+    cat.add_column(d, name='major_sigma_pc', index=8)
+    cat['major_sigma_pc'].unit = u.pc
+
+    area_ellipse = []
+    major_sigma = cat['major_sigma_pc']
+    minor_sigma = cat['minor_sigma_pc']
+    for i in range(len(cat)):
+        area_ellipse.append(np.pi * major_sigma[i] * minor_sigma[i] * (2.3548 * 0.5) ** 2)
+    cat.add_column(area_ellipse, name='area_ellipse_pc', index=2)
+
+    angle = cat['position_angle']
+    for i in range(len(cat)):
+        angle[i] = (angle[i] + 180) % 180
+        if angle[i] > 90:
+            angle[i] -= 90
+    cat.add_column(angle, name='angle-normalized', index=8)
+
+    cat.remove_columns(['_idx', 'x_cen', 'y_cen'])
+    masses = []
+    for row in cat:
+        row['area_ellipse'] = short_figures(row['area_ellipse_pc'], 0)
+        row['area_exact'] = short_figures(row['area_exact'], 0)
+        row['major_sigma'] = short_figures(row['major_sigma_pc'], 0)
+        row['minor_sigma'] = short_figures(row['minor_sigma_pc'], 0)
+        row['position_angle'] = int(row['angle-normalized'])
+        row['radius'] = short_figures(row['radius'], 0)
+        num = row['mass']
+        num = "{:.1e}".format(num)
+        masses.append(num)
+        row['longitude'] = short_figures(row['longitude'], 0)
+        row['latitude'] = short_figures(row['latitude'], 0)
+
+    cat.remove_columns(['major_sigma_pc', 'minor_sigma_pc', 'area_ellipse_pc', 'angle-normalized', 'Mass_log10', 'Radius_log10'])
+    cat.rename_column('distancer', 'distance')
+    cat.remove_column('mass')
+    cat.add_column(masses, name='mass', index=7)
+    i = 0
+    while i < len(cat):
+        if cat['major_sigma'][i] < cat['minor_sigma'][i]:
+            cat.remove_row(i)
+        else:
+            i += 1
+
+    col_name = []
+    for i in range(len(cat)):
+        col_name.append("Cloud {}".format(i))
+    cat.add_column(col_name, name='cloud', index=0)
+
+
+
+    cat.write('Catalog_2D_final_april9', format='latex', overwrite=True)
+    #cat.write('2D_Catalog.csv', format='csv', overwrite=True)
+    #cat.show_in_browser()
+    cat.write('2D_Catalog_april9.fits')
+
+
+def miviliEdit():
+    mivilie = Table.read('/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/Other catalogs/mivillie.fits')
+    chen = Table.read('/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/Other catalogs/ChenCatalogs.fits')
+    masses = []
+    radii = []
+    masses_log10 = []
+    radii_log10 = []
+
+    for i in range(len(mivilie)):
+        if 8 < mivilie["Rgal"][i] < 9:
+            if mivilie["INF"][i] == 1:
+                masses.append(mivilie['Mfar'][i])
+                radii.append(mivilie['Rfar'][i])
+            else:
+                masses.append(mivilie['Mnear'][i])
+                radii.append(mivilie['Rnear'][i])
+
+    for i in range(len(masses)):
+        masses_log10.append(np.log10(masses[i]))
+        radii_log10.append(np.log10(radii[i]))
+
+    # mivilie.add_column(masses, name='mass-NOT_ordered', index=0)
+    # mivilie.add_column(radii, name='radii-NOT_ordered', index=0)
+    # mivilie.add_column(masses_log10, name='mass_log-NOT_ordered', index=0)
+    # mivilie.add_column(radii_log10, name='radii_log-NOT_ordered', index=0)
+
+    mivilieMassSize = Table([masses, radii, masses_log10, radii_log10], names=('mass', 'radii', 'massLof', 'radiusLog'))
+    mivilieMassSize.write('mivilieMassSize.fits')
+    chen.show_in_browser()
+
+
+"""
+plot_artists = ax.plot(x[keep], y[keep], 'o', color='#595959', markersize=3, alpha=0.8, zorder=3,
+                       label='Rice et al. 2016', mec='none')
+
+plot_artists = ax.plot(x[keep], y[keep], '.', color='#dc00d6', markersize=3, alpha=0.8, zorder=6,
+                       label='Chen et al. 2020', mec='none')
+
+plot_artists = ax.plot(x[keep], y[keep], '8', color='#2800f1', markersize=4, alpha=0.8, zorder=9, label='Larson 1981',
+                       mec='none')
+
+plot_artists = ax.plot(x[keep], y[keep], 'o', color='#fc0107', markersize=3, alpha=1.0, zorder=12,
+                       label='Miville-Deschnes et al. 2016', mec='none')
+
+plot_artists = ax.plot(x[keep], y[keep], '1', color='#108001', markersize=3, alpha=1.0, zorder=15,
+                       label='Leike 2D Projection', mec='none')
+
+"""
+
+
+def simple_Dend3d():
+    file_path = '/Users/shlomo/Desktop/Thesis/pythonProject/3D_Dust/perseus_3d_cutout.fits'
+    # distance = 294
+    image = fits.getdata(file_path)
+    wcs = WCS(fits.open(file_path)[0].header)
+    d = Dendrogram.compute(image, min_value=25, min_delta=25, min_npix=150, verbose=True)
+    metadata = {'data_unit': u.cm ** (-3), 'spatial_scale': 1 * u.parsec, 'wcs': wcs}
+    cat = ppp_catalog(d, metadata)
+    #cat.write('Final_catalog.fits')
+    cat.show_in_browser()
+
+
+# catalog = Table.read('Final_catalog.fits')
+# file = open("/Users/shlomo/Desktop/Thesis/pythonProject/Code/nodes_dend_25.dat", 'rb')
+# nodes = pickle.load(file)
+# hf.table_objects_deleted_2(nodes, catalog, 500)
+# hf.recognizing_clouds(catalog)
+
+# ppcloud("OrionA", 211.25, -19.65, 407)
+# ppcloud("OrionB", 208.11, -15.17, 378)
+# ppcloud("OrionLAM", 195.87, -12.87, 341)
+
+"""
+Turn all 3D cutouts to obj objects, turn extinction to 2D images. -- maybe can do the same using just coords.
+Upload bubble.
+"""
+
+
+# nH2_nden = fits.getdata("/Users/shlomo/Desktop/Thesis/pythonProject/3D_Dust/ophiuchus_3d_cutout.fits")
+#
+# hdu = fits.PrimaryHDU(nH2_nden)
+# hdu.header['CDELT1'] = 3e+18
+# hdu.header['CDELT2'] = 3e+18
+# hdu.header['CDELT3'] = 3e+18
+# hdu.header['CUNIT1'] = 'cm'
+# hdu.header['CUNIT2'] = 'cm'
+# hdu.header['CUNIT3'] = 'cm'
+# hdu.header['BTYPE'] = 'density'
+# hdu.header['BUNIT'] = '1/cm/cm/cm'
+# hdu.header['CRVAL1'] = 0
+# hdu.header['CRVAL2'] = 0
+# hdu.header['CRVAL3'] = 0
+# hdu.header['CRPIX1'] = 0
+# hdu.header['CRPIX2'] = 0
+# hdu.header['CRPIX3'] = 0
+#
+# cloud = 'ophiuchus_test'
+#
+# hdu.writeto('{}_yt_density.fits'.format(cloud), overwrite=True)
+# w = WCS('/Users/shlomo/Desktop/Thesis/pythonProject/3D_Dust/ophiuchus_3d_cutout.fits')
+# data = fits.getdata("/Users/shlomo/Desktop/Thesis/pythonProject/3D_Dust/ophiuchus_3d_cutout.fits")
+#
+# zpix_cen = data.shape[0] / 2.
+# ypix_cen = data.shape[1] / 2.
+# xpix_cen = data.shape[2] / 2.
+#
+# world = w.wcs_pix2world([[xpix_cen, ypix_cen, zpix_cen]], 0) - 2
+# c = SkyCoord(u=world[0, 0] * u.pc, v=world[0, 1] * u.pc, w=world[0, 2] * u.pc, frame='galactic',
+#              representation_type='cartesian')
+#
+# lcen = np.round(c.spherical.lon.deg, 2)  # Add these propeties to the catalog
+# bcen = np.round(c.spherical.lat.deg, 2)
+# dcen = c.spherical.distance.pc.astype(int)
+#
+# ds = yt.load('{}_yt_density.fits'.format(cloud, cloud))
+#
+# L = world[0] * -1
+#
+# # Column density PNGS
+# ytproj = yt.OffAxisProjectionPlot(ds, L, 'density', north_vector=[0, 0, 1])
+# ytproj.set_cmap('density', 'Greys')
+# ytproj.show()
+#
+# # Column density fits
+# fitsproj = yt.FITSOffAxisProjection(ds, L, 'density', north_vector=[0, 0, 1])
+# Nproj = fitsproj.get_data('density').value
+# Aproj = Nproj / (1.67e+22)
+#
+# theta = 1. * 206265 / dcen
+# fitsproj.create_sky_wcs(sky_center=(lcen, bcen), sky_scale=(theta, 'arcsec/pc'), ctype=['GLON-CAR', 'GLAT-CAR'])
+# fitsproj.writeto('{}_yt_extinction.fits'.format(cloud, cloud), overwrite=True)
+#
+# data, header = fits.getdata("{}_yt_extinction.fits".format(cloud, cloud), header=True)
+# header['EXTNAME'] = 'EXTINCTION'
+# header['BTYPE'] = 'K Band extinction'
+# header['BUNIT'] = 'mag'
+# fits.writeto("{}_yt_extinction.fits".format(cloud), Aproj, header, overwrite=True)
+# print(lcen, bcen, dcen)
+
+def test_2d():
+    file_path = '/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/2D_offical_catalog.fits'
+    header = fits.getheader(file_path)
+    image = fits.getdata(file_path)
+    d = Dendrogram.compute(image, min_value=0.1, min_delta=0.15,
+                           min_npix=300)  # can make min delta 0.05 for clouds with no features.
+
+    lcen, bcen, distance = 357.51, 13.63, 142
+    metadata = {'data_unit': u.mag, 'spatial_scale': header["CDELT2"] * u.degree, 'distance': distance * 1.0,
+                'latitude': bcen * 1.0, 'longitude': lcen * 1.0}
+    cat = pp_catalog(d, metadata)
+
+    print(cat['radius'])
+    print(cat['area_ellipse'])
+    print(cat['major_sigma'])
+    print(cat['minor_sigma'])
+    print(cat['area_exact'])
+    # "'major_sigma', 'minor_sigma', 'radius', 'area_ellipse', 'area_exact'"
+
+    """
+    Radius before change: 
+    
+            radius     
+            pc       
+    -----------------
+    4.970276192329216
+    9.556195950639616
+    3.560499763465018
+    1.4937860324097
+    2.277911467593145
+    """
+
+
+def make_bubble():
+    import pyvista as pv
+
+    bubble = Table.read('/Users/shlomo/Desktop/Thesis/pythonProject/Local_Bubble_Pelgrims2020.fits')
+
+    x_ = np.array(bubble['x'])
+    y_ = np.array(bubble['y'])
+    z_ = np.array(bubble['z'])
+
+    arr = []
+    for i in range(len(x_)):
+        arr.append((x_[i], y_[i], z_[i]))
+
+    print(arr)
+    arr = np.array(arr)
+    cloud = pv.PolyData(arr)
+    surf = cloud.delaunay_2d()
+    # surf.plot(show_edges=True)
+    plotter = pv.Plotter()  # create a scene
+    _ = plotter.add_mesh(surf, color='#0000FF')  # add the mesh to the scene
+    # _ = plotter.add_mesh(iso, color = '#0000FF')
+    plotter.export_obj("BubbleToObj1")  # save as an OBJ
+    #
+
+    """
+    glueviz
+    """
+
+
+# file_path = '/Users/shlomo/Desktop/Thesis/pythonProject/Leike/Leike General/leike_2020_xyz.fits'
+#     # distance = 294
+# image = fits.getdata(file_path)
+# wcs = WCS(fits.open(file_path)[0].header)
+# d = Dendrogram.compute(image, min_value=25, min_delta=25, min_npix=150, verbose=True)
+# metadata = {'data_unit': u.cm ** (-3), 'spatial_scale': 1 * u.parsec, 'wcs': wcs}  # , 'distance': distance}
+# cat = ppp_catalog(d, metadata)
+# cat.write('Final_catalog_25_updated.fits')
+# cat.show_in_browser()
+
+def make_Catalogs():
+    table_15 = Table.read('Final_catalog_15.fits')
+    file = open("/Users/shlomo/Desktop/Thesis/pythonProject/Code/nodes_dend_15.dat", 'rb')
+    nodes_15 = pickle.load(file)
+
+    table_20 = Table.read('Final_catalog_20.fits')
+    file = open("/Users/shlomo/Desktop/Thesis/pythonProject/Code/nodes_dend_20.dat", 'rb')
+    nodes_20 = pickle.load(file)
+
+    table_25 = Table.read('Final_catalog_25.fits')
+    file = open("/Users/shlomo/Desktop/Thesis/pythonProject/Code/nodes_dend_25.dat", 'rb')
+    nodes_25 = pickle.load(file)
+
+    print(len(table_25))
+
+    hf.table_objects_deleted_2(nodes_15, table_15, min_mass=500)
+    hf.table_objects_deleted_2(nodes_20, table_20, min_mass=500)
+    hf.table_objects_deleted_2(nodes_25, table_25, min_mass=500)
+
+    print(len(table_15), len(table_20), len(table_25))
+
+
+def radius_range(lst, lst2, mine, maxe):
+    counter_1 = 0
+    for i in range(len(lst)):
+        if mine < lst[i] < maxe:
+            counter_1 += 1
+
+    counter_2 = 0
+    for i in range(len(lst2)):
+        if mine < lst2[i] < maxe:
+            counter_2 += 1
+
+    return counter_2 / counter_1
+
+
+    cat = Table.read('Final_catalog.fits')
+    table = Table.read('table_25_filter.fits')
+
+    radii = np.log10(cat['radius'])
+    radii_filter = np.log10(table['radius'])
+
+    fractions = []
+    sizes = [0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.1]
+
+    for i in range(0, len(sizes) - 1):
+        fraction = radius_range(radii, radii_filter, sizes[i], sizes[i + 1])
+        fractions.append(fraction)
+
+    sizes = ['0.5-0.6', '0.6-0.7', '0.7-0.8', '0.8-0.9', '0.9-1', '1-1.1']
+
+    fig = plt.figure()
+
+    plt.scatter(sizes, fractions, color='b', marker='*', s=160, alpha=1)
+    plt.gca().set_yticklabels(['{:.0f}%'.format(fractions * 100) for fractions in plt.gca().get_yticks()])
+
+    plt.xlabel('Log$_{10}$ Radius Ranges (pc)', weight='normal', size=24)
+    plt.ylabel('Percentage In Filtered Catalog', weight='normal', size=24)
+
+    # Set tick label properties
+    plt.tick_params('x', labelsize=16)
+    plt.tick_params('y', labelsize=16)
+
+    fig.set_size_inches(9.5, 7.5, forward=False)
+
+    plt.show()
+
+def surface_Densities():
+    cat = Table.read('/Users/shlomo/Desktop/Thesis/pythonProject/Combined plots/2D_Catalog_april9.fits')
+
+    length = len(cat)
+    surfaces = []
+    for i in range(length):
+        surfaces.append(cat['surface_density'][i])
+    total = sum(surfaces)
+    print(total/length)
+
+    import statistics
+    print("Standard Deviation of sample is % s "
+          % statistics.stdev(surfaces))
+
+simple_Dend3d()
